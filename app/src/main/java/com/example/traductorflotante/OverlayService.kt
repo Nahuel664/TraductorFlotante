@@ -42,10 +42,12 @@ import com.google.mlkit.nl.translate.TranslatorOptions
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlin.math.abs
@@ -64,16 +66,21 @@ class OverlayService : Service() {
     private var held: Image? = null          // último fotograma de la pantalla
     private var bubble: TextView? = null
     private var result: FrameLayout? = null
+    private var banner: TextView? = null
+    private val hideBanner = Runnable { removeBanner() }
     private var w = 0
     private var h = 0
     private var busy = false
     private var started = false
+    private var nullCount = 0
 
-    // OCR (alfabeto latino: inglés, español, francés, etc.)
-    private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-    private val langId = LanguageIdentification.getClient(
-        LanguageIdentificationOptions.Builder().setConfidenceThreshold(0.6f).build()
+    private fun newRecognizer() = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+    private fun newLangId() = LanguageIdentification.getClient(
+        LanguageIdentificationOptions.Builder().setConfidenceThreshold(0.4f).build()
     )
+
+    private var recognizer = newRecognizer()
+    private var langId = newLangId()
     private val translators = HashMap<String, Translator>()
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -185,6 +192,7 @@ class OverlayService : Service() {
         if (busy) return
         busy = true
         removeResult()
+        removeBanner()
         bubble?.visibility = View.INVISIBLE      // para que la burbuja no salga en la captura
         handler.postDelayed({ grab() }, 300)
     }
@@ -193,10 +201,13 @@ class OverlayService : Service() {
         val img = held
         bubble?.visibility = View.VISIBLE
         if (img == null) {
-            toast("No pude capturar la pantalla, intenta de nuevo")
             busy = false
+            nullCount++
+            if (nullCount >= 2) fullRestart("No llega imagen de la pantalla")
+            else showBanner("No pude capturar la pantalla. Intenta de nuevo.")
             return
         }
+        nullCount = 0
         val bmp = try {
             val pl = img.planes[0]
             pl.buffer.rewind()
@@ -206,41 +217,94 @@ class OverlayService : Service() {
             if (b !== full) full.recycle()
             b
         } catch (e: Exception) {
-            toast("Error al capturar: ${e.message}")
             busy = false
+            fullRestart("Error al capturar: ${e.javaClass.simpleName}: ${e.message}")
             return
         }
         scope.launch { process(bmp) }
     }
 
+    // Intenta traducir; si falla, reinicia el lector/traductores y reintenta una vez.
     private suspend fun process(bmp: Bitmap) {
         try {
-            val target = getSharedPreferences("prefs", MODE_PRIVATE).getString("target", "en")!!
-            val text = recognizer.process(InputImage.fromBitmap(bmp, 0)).await()
-            val items = ArrayList<Pair<Rect, String>>()
-            for (block in text.textBlocks) {
-                val rect = block.boundingBox ?: continue
-                val src = block.text.replace("\n", " ").trim()
-                if (src.count { it.isLetter() } < 3) continue   // ignora números, horas, iconos
-                val code = langId.identifyLanguage(src).await()
-                if (code == "und" || code == target) continue
-                val srcLang = TranslateLanguage.fromLanguageTag(code) ?: continue
-                val tr = translators.getOrPut("$srcLang>$target") {
-                    Translation.getClient(
-                        TranslatorOptions.Builder()
-                            .setSourceLanguage(srcLang).setTargetLanguage(target).build()
-                    )
+            var attempt = 0
+            while (true) {
+                try {
+                    showBanner("Traduciendo…", 30000)
+                    translateScreen(bmp)
+                    break
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    attempt++
+                    val msg = "${e.javaClass.simpleName}: ${e.message}"
+                    if (attempt >= 2) { fullRestart(msg); break }
+                    showBanner("Error: $msg\nReiniciando y reintentando…", 8000)
+                    softReset()
+                    delay(800)
                 }
-                tr.downloadModelIfNeeded().await()   // solo descarga la primera vez
-                items += rect to tr.translate(src).await()
             }
-            if (items.isEmpty()) toast("No encontré texto para traducir") else showResult(items)
-        } catch (e: Exception) {
-            toast("Error: ${e.message}")
         } finally {
             busy = false
             bmp.recycle()
         }
+    }
+
+    private suspend fun translateScreen(bmp: Bitmap) {
+        val target = getSharedPreferences("prefs", MODE_PRIVATE).getString("target", "en")!!
+        val text = recognizer.process(InputImage.fromBitmap(bmp, 0)).await()
+        val items = ArrayList<Pair<Rect, String>>()
+        for (block in text.textBlocks) {
+            val rect = block.boundingBox ?: continue
+            if (rect.height() < 24 || rect.width() < 50) continue          // ignora recortes diminutos
+            val src = block.text.replace("\n", " ").trim()
+            if (src.count { it.isLetter() } < 4) continue                  // ignora ruido
+            val code = langId.identifyLanguage(src).await()
+            if (code == "und" || code == target) continue
+            val srcLang = TranslateLanguage.fromLanguageTag(code) ?: continue
+            val key = "$srcLang>$target"
+            if (!translators.containsKey(key)) {
+                showBanner("Preparando idioma «$srcLang»… la primera vez puede tardar", 60000)
+            }
+            val tr = translators.getOrPut(key) {
+                Translation.getClient(
+                    TranslatorOptions.Builder()
+                        .setSourceLanguage(srcLang).setTargetLanguage(target).build()
+                )
+            }
+            tr.downloadModelIfNeeded().await()
+            val out = tr.translate(src).await()
+            if (out.equals(src, ignoreCase = true)) continue
+            items += rect to out
+        }
+        removeBanner()
+        if (items.isEmpty()) {
+            showBanner("Nada que traducir (leí ${text.textBlocks.size} bloques; destino: $target)")
+        } else {
+            showResult(items)
+        }
+    }
+
+    private fun softReset() {
+        translators.values.forEach { try { it.close() } catch (_: Exception) {} }
+        translators.clear()
+        try { recognizer.close() } catch (_: Exception) {}
+        try { langId.close() } catch (_: Exception) {}
+        recognizer = newRecognizer()
+        langId = newLangId()
+    }
+
+    // Último recurso: cierra la burbuja y abre la app para volver a iniciar.
+    private fun fullRestart(msg: String) {
+        Toast.makeText(
+            applicationContext, "Error: $msg\nReiniciando la app…", Toast.LENGTH_LONG
+        ).show()
+        try {
+            startActivity(
+                Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        } catch (_: Exception) {}
+        stopSelf()
     }
 
     private fun showResult(items: List<Pair<Rect, String>>) {
@@ -279,22 +343,48 @@ class OverlayService : Service() {
         result = null
     }
 
-    private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+    private fun showBanner(msg: String, ms: Long = 4000) {
+        handler.removeCallbacks(hideBanner)
+        removeBanner()
+        val tv = TextView(this).apply {
+            text = msg
+            textSize = 14f
+            setTextColor(Color.WHITE)
+            setBackgroundColor(0xE6000000.toInt())
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            maxWidth = (w * 0.9).toInt()
+        }
+        val lp = LP(
+            LP.WRAP_CONTENT, LP.WRAP_CONTENT, LP.TYPE_APPLICATION_OVERLAY,
+            LP.FLAG_NOT_FOCUSABLE or LP.FLAG_NOT_TOUCHABLE, PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL; y = dp(48) }
+        wm.addView(tv, lp)
+        banner = tv
+        handler.postDelayed(hideBanner, ms)
+    }
+
+    private fun removeBanner() {
+        banner?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+        banner = null
+    }
+
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
     override fun onDestroy() {
+        handler.removeCallbacksAndMessages(null)
         scope.cancel()
         if (::wm.isInitialized) {
             removeResult()
+            removeBanner()
             bubble?.let { try { wm.removeView(it) } catch (_: Exception) {} }
         }
         held?.close()
         display?.release()
         reader?.close()
         projection?.stop()
-        translators.values.forEach { it.close() }
-        recognizer.close()
-        langId.close()
+        translators.values.forEach { try { it.close() } catch (_: Exception) {} }
+        try { recognizer.close() } catch (_: Exception) {}
+        try { langId.close() } catch (_: Exception) {}
         super.onDestroy()
     }
 }
