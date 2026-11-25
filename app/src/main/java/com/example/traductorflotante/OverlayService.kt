@@ -50,6 +50,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.abs
 
 private typealias LP = WindowManager.LayoutParams
@@ -224,24 +225,29 @@ class OverlayService : Service() {
         scope.launch { process(bmp) }
     }
 
+    // Ejecuta un paso con límite de tiempo; si se cuelga, lanza un error que dice cuál fue.
+    private suspend fun <T : Any> step(label: String, ms: Long, block: suspend () -> T): T {
+        return withTimeoutOrNull(ms) { block() }
+            ?: throw Exception("Se colgó en «$label» (más de ${ms / 1000} s)")
+    }
+
     // Intenta traducir; si falla, reinicia el lector/traductores y reintenta una vez.
     private suspend fun process(bmp: Bitmap) {
         try {
             var attempt = 0
             while (true) {
                 try {
-                    showBanner("Traduciendo…", 30000)
                     translateScreen(bmp)
                     break
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
                     attempt++
-                    val msg = "${e.javaClass.simpleName}: ${e.message}"
+                    val msg = "${e.message ?: e.javaClass.simpleName}"
                     if (attempt >= 2) { fullRestart(msg); break }
                     showBanner("Error: $msg\nReiniciando y reintentando…", 8000)
                     softReset()
-                    delay(800)
+                    delay(1500)
                 }
             }
         } finally {
@@ -252,34 +258,43 @@ class OverlayService : Service() {
 
     private suspend fun translateScreen(bmp: Bitmap) {
         val target = getSharedPreferences("prefs", MODE_PRIVATE).getString("target", "en")!!
-        val text = recognizer.process(InputImage.fromBitmap(bmp, 0)).await()
+
+        showBanner("1) Leyendo texto de la pantalla…", 60000)
+        val text = step("leer texto (OCR)", 20000) {
+            recognizer.process(InputImage.fromBitmap(bmp, 0)).await()
+        }
+
         val items = ArrayList<Pair<Rect, String>>()
-        for (block in text.textBlocks) {
+        val blocks = text.textBlocks
+        for ((i, block) in blocks.withIndex()) {
             val rect = block.boundingBox ?: continue
             if (rect.height() < 24 || rect.width() < 50) continue          // ignora recortes diminutos
             val src = block.text.replace("\n", " ").trim()
             if (src.count { it.isLetter() } < 4) continue                  // ignora ruido
-            val code = langId.identifyLanguage(src).await()
+
+            showBanner("2) Detectando idioma (${i + 1}/${blocks.size})…", 60000)
+            val code = step("detectar idioma", 10000) { langId.identifyLanguage(src).await() }
             if (code == "und" || code == target) continue
             val srcLang = TranslateLanguage.fromLanguageTag(code) ?: continue
+
             val key = "$srcLang>$target"
-            if (!translators.containsKey(key)) {
-                showBanner("Preparando idioma «$srcLang»… la primera vez puede tardar", 60000)
-            }
             val tr = translators.getOrPut(key) {
                 Translation.getClient(
                     TranslatorOptions.Builder()
                         .setSourceLanguage(srcLang).setTargetLanguage(target).build()
                 )
             }
-            tr.downloadModelIfNeeded().await()
-            val out = tr.translate(src).await()
+            showBanner("3) Idioma «$srcLang»: preparando paquete (solo la 1.ª vez)…", 240000)
+            step("descargar idioma $srcLang", 180000) { tr.downloadModelIfNeeded().await(); true }
+
+            showBanner("4) Traduciendo (${i + 1}/${blocks.size})…", 60000)
+            val out = step("traducir", 20000) { tr.translate(src).await() }
             if (out.equals(src, ignoreCase = true)) continue
             items += rect to out
         }
         removeBanner()
         if (items.isEmpty()) {
-            showBanner("Nada que traducir (leí ${text.textBlocks.size} bloques; destino: $target)")
+            showBanner("Nada que traducir (leí ${blocks.size} bloques; destino: $target)")
         } else {
             showResult(items)
         }
